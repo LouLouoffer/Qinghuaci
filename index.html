@@ -100,7 +100,9 @@
     border-radius: 4px; padding: 28px 20px;
     text-align: center; cursor: pointer;
     transition: all 0.3s ease;
+    user-select: none; -webkit-tap-highlight-color: transparent;
   }
+  .upload-box:focus { outline: 2px solid var(--qinghua); outline-offset: 2px; }
   .upload-box:hover, .upload-box.drag {
     background: rgba(29, 63, 122, 0.06);
     border-color: var(--qinghua-deep);
@@ -211,11 +213,11 @@
     <aside class="panel">
       <div>
         <div class="section-label">上传 · Upload</div>
-        <label class="upload-box" id="uploadBox" for="fileInput">
-          <input type="file" id="fileInput" accept="image/*">
+        <input type="file" id="fileInput" accept="image/*">
+        <div class="upload-box" id="uploadBox" role="button" tabindex="0">
           <div class="title">选择宠物照片</div>
           <div class="sub">Click or drop an image · JPG / PNG</div>
-        </label>
+        </div>
       </div>
 
       <div>
@@ -434,35 +436,82 @@ function buildPatternSelector() {
   });
 }
 
-// Image → blue-and-white porcelain pixel transform
-function processToQinghua(img, contrast, hueDepth) {
+// Image → 工笔青花瓷 transform
+// Pipeline: pre-blur → 4-level color quantize → boundary edge detection → composite
+function processToQinghua(img, simplify, lineStrength) {
   const off = document.createElement('canvas');
   const size = INNER_R * 2;
   off.width = size; off.height = size;
   const offCtx = off.getContext('2d');
 
+  // Fit image into the well
   const aspect = img.width / img.height;
   let dw, dh;
   if (aspect > 1) { dh = size; dw = size * aspect; }
   else { dw = size; dh = size / aspect; }
   const zoom = parseFloat(zoomSlider.value);
   dw *= zoom; dh *= zoom;
+
+  // Pre-blur: this is what simplifies the photo so flat color zones can form
+  offCtx.filter = `blur(${simplify}px)`;
   offCtx.drawImage(img, (size - dw) / 2, (size - dh) / 2, dw, dh);
+  offCtx.filter = 'none';
 
   const imgData = offCtx.getImageData(0, 0, size, size);
   const d = imgData.data;
-  const deepR = 15, deepG = 35, deepB = 90;
-  const lightR = 248, lightG = 243, lightB = 230;
-  for (let i = 0; i < d.length; i += 4) {
-    let lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    lum = ((lum - 128) * contrast) + 128;
-    lum = Math.max(0, Math.min(255, lum));
-    let t = 1 - lum / 255;
-    t = Math.pow(t, 1.6) * (hueDepth / 60);
-    t = Math.min(1, t);
-    d[i]     = lightR * (1 - t) + deepR * t;
-    d[i + 1] = lightG * (1 - t) + deepG * t;
-    d[i + 2] = lightB * (1 - t) + deepB * t;
+  const N = size * size;
+
+  // Step 1: compute per-pixel quantized level (0=paper, 3=deepest blue)
+  // Slight contrast stretch before quantizing keeps the levels well-separated
+  const levels = new Uint8Array(N);
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+    let v = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    v = ((v - 128) * 1.3) + 128;
+    v = Math.max(0, Math.min(255, v));
+    // 4 levels via fixed thresholds — these define the "分染" steps
+    if      (v > 205) levels[j] = 0; // 留白 — paper
+    else if (v > 145) levels[j] = 1; // 淡青 — wash
+    else if (v >  75) levels[j] = 2; // 中青 — mid
+    else              levels[j] = 3; // 深青 — deep
+  }
+
+  // Step 2: boundary edges — only where neighboring quantized levels differ.
+  // This skips all the texture/fur noise and only outlines real shape changes,
+  // which is exactly what 工笔白描 does.
+  const edges = new Float32Array(N);
+  for (let y = 1; y < size - 1; y++) {
+    for (let x = 1; x < size - 1; x++) {
+      const j = y * size + x;
+      const c = levels[j];
+      let diff = 0;
+      // 4-neighbor check, weighted by level distance
+      diff += Math.abs(c - levels[j - 1]);
+      diff += Math.abs(c - levels[j + 1]);
+      diff += Math.abs(c - levels[j - size]);
+      diff += Math.abs(c - levels[j + size]);
+      edges[j] = diff;
+    }
+  }
+
+  // Step 3: paint. Each pixel = palette[level], with edge pixels pulled toward ink color.
+  // Palette is intentionally restrained to feel like cobalt washes on rice paper.
+  const palette = [
+    [248, 243, 230], // 留白 paper
+    [196, 211, 228], // 淡青 pale wash
+    [ 96, 132, 180], // 中青 medium
+    [ 26,  60, 122], // 深青 deep
+  ];
+  const ink = [10, 30, 80]; // outline color
+
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) {
+    const [pr, pg, pb] = palette[levels[j]];
+    // edges[j] is in 0..~6+, normalize and apply strength
+    let e = Math.min(1, (edges[j] / 3) * lineStrength);
+    // smooth the edge falloff a touch so lines feel inked, not pixelated
+    e = e * e * (3 - 2 * e);
+    d[i]     = pr * (1 - e) + ink[0] * e;
+    d[i + 1] = pg * (1 - e) + ink[1] * e;
+    d[i + 2] = pb * (1 - e) + ink[2] * e;
   }
   offCtx.putImageData(imgData, 0, 0);
   return off;
@@ -513,19 +562,21 @@ function render() {
 
   // processed pet image
   if (sourceImage) {
-    const contrast = parseFloat(contrastSlider.value);
-    const hueDepth = parseFloat(hueSlider.value);
-    const processed = processToQinghua(sourceImage, contrast, hueDepth);
+    const simplify = parseFloat(simplifySlider.value);
+    const lineStrength = parseFloat(lineSlider.value);
+    const processed = processToQinghua(sourceImage, simplify, lineStrength);
     ctx.save();
     ctx.beginPath();
     ctx.arc(CX, CY, INNER_R - 4, 0, Math.PI * 2);
     ctx.clip();
     ctx.drawImage(processed, CX - INNER_R, CY - INNER_R);
     ctx.restore();
-    const innerShadow = ctx.createRadialGradient(CX, CY, INNER_R * 0.85, CX, CY, INNER_R);
-    innerShadow.addColorStop(0, 'rgba(0,0,0,0)');
-    innerShadow.addColorStop(1, 'rgba(15, 36, 82, 0.12)');
-    ctx.fillStyle = innerShadow;
+    // 留白 vignette — fade outer edge to paper color, like an unfinished ink painting
+    const vignette = ctx.createRadialGradient(CX, CY, INNER_R * 0.55, CX, CY, INNER_R);
+    vignette.addColorStop(0, 'rgba(246, 239, 222, 0)');
+    vignette.addColorStop(0.75, 'rgba(246, 239, 222, 0.15)');
+    vignette.addColorStop(1, 'rgba(246, 239, 222, 0.85)');
+    ctx.fillStyle = vignette;
     ctx.beginPath(); ctx.arc(CX, CY, INNER_R, 0, Math.PI * 2); ctx.fill();
   }
 
@@ -580,6 +631,10 @@ function loadImageFile(file) {
 }
 
 fileInput.addEventListener('change', e => loadImageFile(e.target.files[0]));
+uploadBox.addEventListener('click', () => fileInput.click());
+uploadBox.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+});
 uploadBox.addEventListener('dragover', e => { e.preventDefault(); uploadBox.classList.add('drag'); });
 uploadBox.addEventListener('dragleave', () => uploadBox.classList.remove('drag'));
 uploadBox.addEventListener('drop', e => {
@@ -587,6 +642,9 @@ uploadBox.addEventListener('drop', e => {
   uploadBox.classList.remove('drag');
   loadImageFile(e.dataTransfer.files[0]);
 });
+// Prevent the browser from opening the file if user drops it outside the upload box
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => e.preventDefault());
 
 function bindSlider(slider, valEl, fmt = v => v) {
   slider.addEventListener('input', () => {
@@ -594,13 +652,13 @@ function bindSlider(slider, valEl, fmt = v => v) {
     if (sourceImage) render();
   });
 }
-bindSlider(contrastSlider, contrastVal, v => parseFloat(v).toFixed(2));
-bindSlider(hueSlider, hueVal);
+bindSlider(simplifySlider, simplifyVal, v => parseFloat(v).toFixed(1));
+bindSlider(lineSlider, lineVal, v => parseFloat(v).toFixed(2));
 bindSlider(zoomSlider, zoomVal, v => parseFloat(v).toFixed(2));
 
 resetBtn.addEventListener('click', () => {
-  contrastSlider.value = 1.4; contrastVal.textContent = '1.40';
-  hueSlider.value = 55; hueVal.textContent = '55';
+  simplifySlider.value = 2.5; simplifyVal.textContent = '2.5';
+  lineSlider.value = 1.0; lineVal.textContent = '1.00';
   zoomSlider.value = 1.0; zoomVal.textContent = '1.00';
   if (sourceImage) render();
 });
